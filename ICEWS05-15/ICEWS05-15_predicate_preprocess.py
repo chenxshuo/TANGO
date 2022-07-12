@@ -6,7 +6,21 @@ import pandas as pd
 from collections import defaultdict as ddict
 
 
+import logging
+logging.basicConfig(level=logging.DEBUG,
+                    format='[%(levelname)s:%(asctime)s:%(name)s:%(filename)s:%(lineno)d]\t %(message)s',
+)
+logger = logging.getLogger(__name__)
+
+
 def load_quadruples(inPath, fileName, fileName2=None):
+    """
+    Load quadruples from file.
+    :param inPath: dir of the file
+    :param fileName: file name
+    :param fileName2: second file name; if None, only one file is loaded
+    :return: quadruples in np.ndarray with shape (num_quadruple, 4); time set in np.ndarray with shape (num_quadruple,)
+    """
     with open(os.path.join(inPath, fileName), "r") as fr:
         quadrupleList = []
         times = set()
@@ -46,9 +60,31 @@ def get_total_number(inPath, fileName):
 
 
 def get_data_with_t(data, tim, split):
+    """
+    Get data with time.
+    :param data: quadruples from a split of the dataset
+    :type data: np.ndarray with shape (num_quadruple, 4)
+    :param tim: **one timestamp**
+    :type tim: int
+    :param split: a split name
+    :type split: str (train, valid, test)
+    :return:
+    (
+        triple_unique.transpose(), shape: (3, num_quadruple),
+        sr2o_tmp, (sub, rel) -> obj, shape: (num_quadruple*2,), with reversed triples
+        trp, list of list of dicts
+        trp_eval, list of list of dicts
+        neib_tmp, entity -> entity, shape: num_entities
+        torch.sparse_coo_tensor(adj_mtx_idx, adj_one, [num_e, 2 * num_rel, num_e]),
+        so2r_tmp,(sub, obj) -> rel, shape: (num_quadruple*2,), with reversed triples
+
+    )
+    :rtype:
+    """
     e1 = [quad[0] for quad in data if quad[3] == tim]  # subject in this ts
     rel = [quad[1] for quad in data if quad[3] == tim]  # relation in this ts
     e2 = [quad[2] for quad in data if quad[3] == tim]  # object in this ts
+    assert len(e1) == len(rel) == len(e2)
 
     triplet = np.array([e1, rel, e2]).transpose()
     triplet_unique = np.unique(triplet, axis=0)  # data without inv rel
@@ -58,20 +94,22 @@ def get_data_with_t(data, tim, split):
     neib = ddict(set)
     so2r = ddict(set)
     for trp_idx in range(len(e1)):
-        sr2o[(e1[trp_idx], rel[trp_idx])].add(e2[trp_idx])
-        sr2o[(e2[trp_idx], rel[trp_idx] + num_rel)].add(e1[trp_idx])
-        neib[e1[trp_idx]].add(e2[trp_idx])
-        neib[e2[trp_idx]].add(e1[trp_idx])
-        # adj_mtx[e1[trp_idx], e2[trp_idx]] = 1 # adjacency matrix
-        # adj_mtx[e2[trp_idx], e1[trp_idx]] = 1
-        adj_mtx_idx.append([e1[trp_idx], rel[trp_idx], e2[trp_idx]])
-        adj_mtx_idx.append([e2[trp_idx], rel[trp_idx] + num_rel, e1[trp_idx]])
-        so2r[(e1[trp_idx], e2[trp_idx])].add(rel[trp_idx])
-        so2r[(e2[trp_idx], e1[trp_idx])].add(rel[trp_idx] + num_rel)
+        sr2o[(e1[trp_idx], rel[trp_idx])].add(e2[trp_idx])  # (subject,relation) -> object
+        sr2o[(e2[trp_idx], rel[trp_idx] + num_rel)].add(e1[trp_idx])  # (object, reverse_relation) -> subject
+        neib[e1[trp_idx]].add(e2[trp_idx])  # subject -> object; means that this subject has a neighbor object
+        neib[e2[trp_idx]].add(e1[trp_idx])  # object -> subject; means that this object has a neighbor subject
+
+        adj_mtx_idx.append([e1[trp_idx], rel[trp_idx], e2[trp_idx]])  # (subject, relation, object)
+        adj_mtx_idx.append([e2[trp_idx], rel[trp_idx] + num_rel, e1[trp_idx]])  # (object, reverse_relation, subject)
+        so2r[(e1[trp_idx], e2[trp_idx])].add(rel[trp_idx])  # (subject, object) -> relation
+        so2r[(e2[trp_idx], e1[trp_idx])].add(rel[trp_idx] + num_rel)  # (object, subject) -> reverse_relation
+
+    # turn value set to list
     sr2o_tmp = {k: list(v) for k, v in sr2o.items()}
     neib_tmp = {k: list(v) for k, v in neib.items()}
     so2r_tmp = {k: list(v) for k, v in so2r.items()}
 
+    #
     adj_mtx_idx_unique = np.unique(adj_mtx_idx, axis=0)
     adj_mtx_idx = torch.tensor(adj_mtx_idx_unique, dtype=int).t()
     adj_one = torch.ones((adj_mtx_idx.shape[1],))
@@ -124,6 +162,7 @@ def get_data_with_t(data, tim, split):
         trp,
         trp_eval,
         neib_tmp,
+        # ref https://pytorch.org/docs/stable/sparse.html#construction
         torch.sparse_coo_tensor(adj_mtx_idx, adj_one, [num_e, 2 * num_rel, num_e]),
         so2r_tmp,
     )
@@ -150,95 +189,127 @@ def construct_adj(data, num_rel):
     return edge_index, edge_type
 
 
-def load_static(num_rel):
-    # data = []
+def load_static(num_rel: int) -> dict:
+    """
+    Loads the static graph data.
+    :param num_rel: number of relations
+    :type num_rel: int
+    :return: a dict with keys (sub,rel), value is a list of objects
+    :rtype: dict
+    """
     sr2o = ddict(set)
 
     for split in ["train", "valid", "test"]:
         for line in open("{}.txt".format(split)):
+            # to lowercase
             sub, rel, obj, _ = map(str.lower, line.strip().split("\t"))
+            # to numeric id
             sub, rel, obj = int(sub), int(rel), int(obj)
-            # data.append((sub, rel, obj))
+            sr2o[(sub, rel)].add(obj)  # original triplet
+            sr2o[(obj, rel + num_rel)].add(sub)  # reverse triplet
 
-            sr2o[(sub, rel)].add(obj)
-            sr2o[(obj, rel + num_rel)].add(sub)
-
+    # set to list for values in dict
     sr2o_all = {k: list(v) for k, v in sr2o.items()}
 
     return sr2o_all
 
 
-data = ddict(list)
-sr2o_all = ddict(list)
-triples = ddict(list)
-adjs = ddict(list)
-timestamp = ddict(list)
-nei = ddict(list)
-so2r_all = ddict(list)
-adjlist = []
-num_e, num_rel = get_total_number("", "stat.txt")
+if __name__ == "__main__":
+    data = ddict(list)
+    sr2o_all = ddict(list)
+    triples = ddict(list)
+    adjs = ddict(list)
+    timestamp = ddict(list)
+    nei = ddict(list)
+    so2r_all = ddict(list)
+    adjlist = []
 
-t_indep_trp = load_static(num_rel)
+    # 10488 entities
+    # 251 relations
+    num_e, num_rel = get_total_number("", "stat.txt")
 
-for split in ["train", "valid", "test"]:
-    quadruple, ts = load_quadruples("", "{}.txt".format(split))
-    for ts_ in ts:
-        print(ts_)
-        timestamp[split].append(ts_)
-        data_ts_, sr2o, trp, trp_eval, neib, adj_mtx, so2r = get_data_with_t(
-            quadruple, ts_, split
-        )
-        data[split].append(data_ts_)  # data without inv rel
-        sr2o_all[split].append(sr2o)  # with inv rel
-        so2r_all[split].append(so2r)
-        nei[split].append(neib)
-        adjlist.append(adj_mtx)
+    # a dict with key (sub,rel), value is a list of objects
+    # e.g. sr2o_all[(1,251)] = [0,6530,4,6]; 1 is subject, 251 is relation, [0,6530,4,6] are valid objects showing
+    # in the whole dataset triple
+    # this doesn't contain the time information
+    t_indep_trp = load_static(num_rel)
 
-        edge_info = ddict(torch.Tensor)
-        edge_info["edge_index"], edge_info["edge_type"] = construct_adj(
-            data_ts_.transpose(), num_rel
-        )
-        edge_info = dict(edge_info)
-        adjs[split].append(edge_info)
+    for split in ["train", "valid", "test"]:
+        # quadruples from a split
+        # ts are all timestamps in this split
+        quadruple, ts = load_quadruples("", "{}.txt".format(split))
+        for ts_ in ts:
+            # for each timestamp
+            print(ts_)
+            # timestamps in different splits are in different keys
+            timestamp[split].append(ts_)
 
-        if split == "train":
-            triples[split].append(trp)  # with inv rel
-        else:
-            triples[split].append(trp)
-            triples["{}_{}".format(split, "tail")].append(trp_eval[0])
-            triples["{}_{}".format(split, "head")].append(trp_eval[1])
+            data_ts_, sr2o, trp, trp_eval, neib, adj_mtx, so2r = get_data_with_t(
+                quadruple, ts_, split
+            )
+            data[split].append(data_ts_)  # data without inv rel
+            sr2o_all[split].append(sr2o)  # with inv rel
+            so2r_all[split].append(so2r)
+            nei[split].append(neib)
+            adjlist.append(adj_mtx)
+
+            edge_info = ddict(torch.Tensor)
+            edge_info["edge_index"], edge_info["edge_type"] = construct_adj(
+                data_ts_.transpose(), num_rel
+            )
+            edge_info = dict(edge_info)
+            adjs[split].append(edge_info)
+
+            if split == "train":
+                triples[split].append(trp)  # with inv rel
+            else:
+                triples[split].append(trp)
+                triples["{}_{}".format(split, "tail")].append(trp_eval[0])
+                triples["{}_{}".format(split, "head")].append(trp_eval[1])
 
 
-data = dict(data)
-sr2o_all = dict(sr2o_all)
-triples = dict(triples)
-adjs = dict(adjs)
-timestamp = dict(timestamp)
-nei = dict(nei)
+    data = dict(data)
+    sr2o_all = dict(sr2o_all)
+    triples = dict(triples)
+    adjs = dict(adjs)
+    timestamp = dict(timestamp)
+    nei = dict(nei)
 
-with open("t_indep_trp.pkl", "wb") as fp:
-    pickle.dump(t_indep_trp, fp)
+    # (sub,rel) -> [obj1,obj2,obj3,...]
+    # with reversed relations
+    with open("t_indep_trp.pkl", "wb") as fp:
+        pickle.dump(t_indep_trp, fp)
 
-with open("data_tKG.pkl", "wb") as fp:
-    pickle.dump(data, fp)
+    # (split) -> array with shape (3,num_quadruples)
+    with open("data_tKG.pkl", "wb") as fp:
+        pickle.dump(data, fp)
 
-with open("sr2o_all_tKG.pkl", "wb") as fp:
-    pickle.dump(sr2o_all, fp)
+    # split -> {(sub,rel) -> [obj1,obj2,obj3,...]}
+    with open("sr2o_all_tKG.pkl", "wb") as fp:
+        pickle.dump(sr2o_all, fp)
 
-with open("triples_tKG.pkl", "wb") as fp:
-    pickle.dump(triples, fp)
+    # training and evaluation triples
+    # contains dict for each training sample
+    with open("triples_tKG.pkl", "wb") as fp:
+        pickle.dump(triples, fp)
 
-with open("adjs_tKG.pkl", "wb") as fp:
-    pickle.dump(adjs, fp)
+    # TBD
+    with open("adjs_tKG.pkl", "wb") as fp:
+        pickle.dump(adjs, fp)
 
-with open("timestamp_tKG.pkl", "wb") as fp:
-    pickle.dump(timestamp, fp)
+    # all timestamps
+    with open("timestamp_tKG.pkl", "wb") as fp:
+        pickle.dump(timestamp, fp)
 
-with open("neighbor_tKG.pkl", "wb") as fp:
-    pickle.dump(nei, fp)
+    # split -> {entity -> entity}
+    # information of neighbors of entities at each timestamp
+    with open("neighbor_tKG.pkl", "wb") as fp:
+        pickle.dump(nei, fp)
 
-with open("adjlist_tKG.pkl", "wb") as fp:
-    pickle.dump(adjlist, fp)
+    # split -> torch.sparse_coo_tensor()
+    with open("adjlist_tKG.pkl", "wb") as fp:
+        pickle.dump(adjlist, fp)
 
-with open("so2r_all_tKG.pkl", "wb") as fp:
-    pickle.dump(so2r_all, fp)
+    # split -> {(sub,obj) -> [rel1,rel2,rel3,...]}
+    with open("so2r_all_tKG.pkl", "wb") as fp:
+        pickle.dump(so2r_all, fp)
